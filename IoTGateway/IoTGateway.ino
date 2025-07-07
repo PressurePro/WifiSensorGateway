@@ -127,7 +127,12 @@ void performFirmwareUpdate(String url) {
     Serial.println("🔌 Disconnected MQTT for update");
   }
   
+  // Set longer timeout for large files
+  httpUpdate.setLedPin(LED_BUILTIN, LOW);
+  httpUpdate.rebootOnUpdate(true);
+  
   WiFiClient client;
+  Serial.println("🔗 Starting HTTP update...");
   t_httpUpdate_return ret = httpUpdate.update(client, url);
   
   switch (ret) {
@@ -138,9 +143,19 @@ void performFirmwareUpdate(String url) {
       break;
     case HTTP_UPDATE_FAILED:
       Serial.printf("❌ Update failed. Error (%d): %s\n", httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
-      // Try to reconnect MQTT after failed update
-      if (WiFi.status() == WL_CONNECTED) {
-        connectMQTT();
+      Serial.println("🔄 Trying alternative update method...");
+      
+      // Try alternative method with HTTPClient
+      if (tryAlternativeUpdate(url)) {
+        Serial.println("✅ Alternative update successful!");
+        delay(3000);
+        ESP.restart();
+      } else {
+        Serial.println("❌ Alternative update also failed");
+        // Try to reconnect MQTT after failed update
+        if (WiFi.status() == WL_CONNECTED) {
+          connectMQTT();
+        }
       }
       break;
     case HTTP_UPDATE_NO_UPDATES:
@@ -356,6 +371,49 @@ void loadCertificates() {
   }
   
   Serial.println("✅ Certificates loaded");
+}
+
+bool tryAlternativeUpdate(String url) {
+  Serial.println("🔄 Attempting alternative update method...");
+  
+  HTTPClient http;
+  http.begin(url);
+  http.setTimeout(30000); // 30 second timeout
+  
+  int httpCode = http.GET();
+  Serial.printf("HTTP Response code: %d\n", httpCode);
+  
+  if (httpCode == HTTP_CODE_OK) {
+    int contentLength = http.getSize();
+    Serial.printf("Content length: %d bytes\n", contentLength);
+    
+    if (contentLength > 0) {
+      // Start the update
+      if (Update.begin(contentLength)) {
+        size_t written = Update.writeStream(http.getStream());
+        if (written == contentLength) {
+          if (Update.end()) {
+            Serial.println("✅ Alternative update completed successfully");
+            http.end();
+            return true;
+          } else {
+            Serial.printf("❌ Update end failed: %s\n", Update.errorString());
+          }
+        } else {
+          Serial.printf("❌ Written size mismatch. Expected: %d, Got: %d\n", contentLength, written);
+        }
+      } else {
+        Serial.printf("❌ Update begin failed: %s\n", Update.errorString());
+      }
+    } else {
+      Serial.println("❌ Content length is 0");
+    }
+  } else {
+    Serial.printf("❌ HTTP GET failed, error: %s\n", http.errorToString(httpCode).c_str());
+  }
+  
+  http.end();
+  return false;
 }
 
 void setup() {
