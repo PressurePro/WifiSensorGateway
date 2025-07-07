@@ -115,6 +115,11 @@ void handleCommandMessage(String &topic, String &payload) {
       delay(2000);
       ESP.restart();
     }
+    if (action == "clear_cache") {
+      Serial.println("🗑️ Clearing sensor cache...");
+      sensorCache.clear();
+      Serial.println("✅ Sensor cache cleared");
+    }
   }
 }
 
@@ -379,9 +384,23 @@ bool tryAlternativeUpdate(String url) {
   HTTPClient http;
   http.begin(url);
   http.setTimeout(30000); // 30 second timeout
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS); // Follow redirects
   
   int httpCode = http.GET();
   Serial.printf("HTTP Response code: %d\n", httpCode);
+  
+  // Handle redirects
+  if (httpCode == HTTP_CODE_MOVED_PERMANENTLY || httpCode == HTTP_CODE_FOUND || httpCode == HTTP_CODE_TEMPORARY_REDIRECT) {
+    String newLocation = http.header("Location");
+    Serial.printf("Redirecting to: %s\n", newLocation.c_str());
+    http.end();
+    
+    // Try the redirected URL
+    http.begin(newLocation);
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    httpCode = http.GET();
+    Serial.printf("Final HTTP Response code: %d\n", httpCode);
+  }
   
   if (httpCode == HTTP_CODE_OK) {
     int contentLength = http.getSize();
@@ -465,21 +484,43 @@ void loop() {
 
   static uint8_t packet[9];
   static int index = 0;
-
   while (Serial1.available()) {
     uint8_t b = Serial1.read();
-    if (index == 0 && (b != 0x80 && b != 0x84 && b != 0x88)) continue;
+    // Debug: Print first few bytes to see what we're receiving
+    static int debugCount = 0;
+    
+    if (debugCount < 20) {
+      Serial.printf("%02X", b);
+      debugCount++;
+      if (debugCount % 10 == 0) Serial.println();
+    }
+    
+    if (index == 0 && (b != 0x80 && b != 0x84 && b != 0x88 && b != 0x90 && b != 0x98)) continue;
     packet[index++] = b;
     if (index == 9) {
       index = 0;
+      
+      // Validate packet - check for reasonable values
+      if (packet[1] == 0x00 && packet[2] == 0x00 && packet[3] == 0x00) {
+        // Skip packets with all-zero serial numbers (likely corrupted)
+        continue;
+      }
+      
+      // Check for reasonable pressure/temperature values
+      if (packet[4] == 0x00 && packet[5] == 0x00) {
+        // Skip packets with all-zero readings (likely corrupted)
+        continue;
+      }
+      
       char serialHex[7];
       sprintf(serialHex, "%02X%02X%02X", packet[1], packet[2], packet[3]);
       
       // Check if we need to remove oldest sensor to make room
       if (sensorCache.size() >= MAX_SENSOR_CACHE_SIZE && sensorCache.find(serialHex) == sensorCache.end()) {
         // Remove the oldest sensor (first in map)
+        String oldestSensor = sensorCache.begin()->second.serialNumber.c_str();
         sensorCache.erase(sensorCache.begin());
-        Serial.println("🗑️ Removed oldest sensor from cache (limit: " + String(MAX_SENSOR_CACHE_SIZE) + ")");
+        Serial.println("🗑️ Removed sensor " + oldestSensor + " from cache (limit: " + String(MAX_SENSOR_CACHE_SIZE) + ")");
       }
       
       SensorReading reading = {
