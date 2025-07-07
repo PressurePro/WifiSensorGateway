@@ -1,0 +1,40 @@
+name: Build Arduino Firmware
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Setup Arduino CLI
+      uses: arduino/setup-arduino-cli@v1
+      with:
+        version: latest
+    
+    - name: Install ESP32 Board
+      run: |
+        arduino-cli core update-index --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+        arduino-cli core install esp32:esp32 --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+    
+    - name: Compile Firmware
+      run: |
+        arduino-cli compile --fqbn esp32:esp32:esp32c6 IoTGateway.ino
+    
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: IoTGateway.ino.bin
+        tag_name: ${{ github.ref_name }}
+        name: Release ${{ github.ref_name }}
+        body: |
+          Firmware binary for IoT Gateway
+          
+          **SHA256:** `$(sha256sum IoTGateway.ino.bin | cut -d' ' -f1)`
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 

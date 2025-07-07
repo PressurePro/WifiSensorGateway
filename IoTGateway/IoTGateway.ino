@@ -14,12 +14,13 @@
 #include "config.h"
 
 #define WIFI_ANT_CONFIG 14
-#define AP_TIMEOUT_MS 15 * 60 * 1000
+#define AP_TIMEOUT_MS 2 * 60 * 1000
 #define DNS_PORT 53
 #define UART_RX 17
 #define UART_TX 18
 #define UART_BAUD 38400
 #define MQTT_BUFFER_SIZE 4096
+#define MAX_SENSOR_CACHE_SIZE 200
 
 String licenseKey = "";
 String deviceId = "";
@@ -36,6 +37,7 @@ unsigned long bootTime;
 unsigned long readingsSent = 0;
 bool inApMode = false;
 unsigned long lastPublishTime = 0;
+unsigned long lastMqttReconnectAttempt = 0; // Track last MQTT reconnect
 
 struct SensorReading {
   std::string serialNumber;
@@ -211,11 +213,26 @@ bool tryWiFiConnection() {
     delay(100);
   }
 
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("❌ WiFi connection failed after " + String((millis() - startAttemptTime) / 1000) + " seconds");
+  } else {
+    Serial.println("✅ WiFi connected successfully");
+  }
+
   return WiFi.status() == WL_CONNECTED;
 }
 
 void startAPMode() {
   Serial.println("📶 Starting AP mode...");
+  
+  // Disconnect from any existing WiFi connection
+  WiFi.disconnect();
+  delay(100);
+  
+  // Set WiFi mode to AP only
+  WiFi.mode(WIFI_AP);
+  delay(100);
+  
   inApMode = true;
   String ssid = "PressurePro-Gateway" + getHardwareId();
   WiFi.softAP(ssid.c_str(), "configureme");
@@ -309,6 +326,38 @@ bool checkCertificateExpiry() {
   return true;
 }
 
+void provisionCertificates() {
+  // Placeholder for certificate provisioning
+  // In a real implementation, this might fetch certificates from a server
+  // For now, we'll just check if we have valid certificates
+  Serial.println("🔐 Checking certificate status...");
+  checkCertificateExpiry();
+}
+
+void loadCertificates() {
+  Serial.println("🔐 Loading certificates for MQTT connection...");
+  
+  prefs.begin("certs", true);
+  String rootCAStr = prefs.getString("rootca", "");
+  String deviceCertStr = prefs.getString("devicecert", "");
+  String privateKeyStr = prefs.getString("privatekey", "");
+  prefs.end();
+  
+  if (!rootCAStr.isEmpty() && !deviceCertStr.isEmpty() && !privateKeyStr.isEmpty()) {
+    Serial.println("📋 Using certificates from preferences");
+    net.setCACert(rootCAStr.c_str());
+    net.setCertificate(deviceCertStr.c_str());
+    net.setPrivateKey(privateKeyStr.c_str());
+  } else {
+    Serial.println("📋 Using embedded certificates");
+    net.setCACert(rootCA);
+    net.setCertificate(deviceCert);
+    net.setPrivateKey(privateKey);
+  }
+  
+  Serial.println("✅ Certificates loaded");
+}
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
@@ -345,6 +394,17 @@ void loop() {
   }
 
   mqtt.loop();
+
+  // MQTT reconnect logic
+  if (WiFi.status() == WL_CONNECTED && !mqtt.connected()) {
+    unsigned long now = millis();
+    if (now - lastMqttReconnectAttempt > 5000) { // 5 second backoff
+      Serial.println("🔄 Attempting MQTT reconnect...");
+      connectMQTT();
+      lastMqttReconnectAttempt = now;
+    }
+  }
+
   static uint8_t packet[9];
   static int index = 0;
 
@@ -356,6 +416,14 @@ void loop() {
       index = 0;
       char serialHex[7];
       sprintf(serialHex, "%02X%02X%02X", packet[1], packet[2], packet[3]);
+      
+      // Check if we need to remove oldest sensor to make room
+      if (sensorCache.size() >= MAX_SENSOR_CACHE_SIZE && sensorCache.find(serialHex) == sensorCache.end()) {
+        // Remove the oldest sensor (first in map)
+        sensorCache.erase(sensorCache.begin());
+        Serial.println("🗑️ Removed oldest sensor from cache (limit: " + String(MAX_SENSOR_CACHE_SIZE) + ")");
+      }
+      
       SensorReading reading = {
         .serialNumber = serialHex,
         .pressureHex = String(packet[4], HEX),
