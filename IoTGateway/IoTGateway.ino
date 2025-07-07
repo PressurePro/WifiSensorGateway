@@ -136,40 +136,64 @@ void performFirmwareUpdate(String url) {
   httpUpdate.setLedPin(LED_BUILTIN, LOW);
   httpUpdate.rebootOnUpdate(true);
   
-  WiFiClient client;
-  Serial.println("🔗 Starting HTTP update...");
-  t_httpUpdate_return ret = httpUpdate.update(client, url);
+  // Try with HTTPClient first (better redirect handling)
+  HTTPClient http;
+  http.begin(url);
+  http.setTimeout(30000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   
-  switch (ret) {
-    case HTTP_UPDATE_OK:
-      Serial.println("✅ Update successful - restarting in 3 seconds...");
-      delay(3000);
-      ESP.restart();
-      break;
-    case HTTP_UPDATE_FAILED:
-      Serial.printf("❌ Update failed. Error (%d): %s\n", httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
-      Serial.println("🔄 Trying alternative update method...");
-      
-      // Try alternative method with HTTPClient
-      if (tryAlternativeUpdate(url)) {
-        Serial.println("✅ Alternative update successful!");
-        delay(3000);
-        ESP.restart();
-      } else {
-        Serial.println("❌ Alternative update also failed");
-        // Try to reconnect MQTT after failed update
-        if (WiFi.status() == WL_CONNECTED) {
-          connectMQTT();
+  Serial.println("🔗 Starting HTTP update with redirects...");
+  int httpCode = http.GET();
+  Serial.printf("HTTP Response code: %d\n", httpCode);
+  
+  if (httpCode == HTTP_CODE_OK) {
+    int contentLength = http.getSize();
+    Serial.printf("Content length: %d bytes\n", contentLength);
+    
+    if (contentLength > 0) {
+      if (Update.begin(contentLength)) {
+        size_t written = Update.writeStream(http.getStream());
+        if (written == contentLength) {
+          if (Update.end()) {
+            Serial.println("✅ Update completed successfully");
+            http.end();
+            delay(3000);
+            ESP.restart();
+          } else {
+            Serial.printf("❌ Update end failed: %s\n", Update.errorString());
+            http.end();
+          }
+        } else {
+          Serial.printf("❌ Written size mismatch. Expected: %d, Got: %d\n", contentLength, written);
+          http.end();
         }
+      } else {
+        Serial.printf("❌ Update begin failed: %s\n", Update.errorString());
+        http.end();
       }
-      break;
-    case HTTP_UPDATE_NO_UPDATES:
-      Serial.println("⚠️ No update found");
-      // Try to reconnect MQTT after no update
-      if (WiFi.status() == WL_CONNECTED) {
-        connectMQTT();
-      }
-      break;
+    } else {
+      Serial.println("❌ Content length is 0");
+      http.end();
+    }
+  } else {
+    Serial.printf("❌ HTTP GET failed, error: %s\n", http.errorToString(httpCode).c_str());
+    http.end();
+  }
+  
+  // If we get here, the HTTPClient method failed, so try the alternative method
+  Serial.println("🔄 HTTPClient method failed, trying alternative...");
+  
+  // Try alternative method with HTTPClient
+  if (tryAlternativeUpdate(url)) {
+    Serial.println("✅ Alternative update successful!");
+    delay(3000);
+    ESP.restart();
+  } else {
+    Serial.println("❌ Alternative update also failed");
+    // Try to reconnect MQTT after failed update
+    if (WiFi.status() == WL_CONNECTED) {
+      connectMQTT();
+    }
   }
 }
 
@@ -381,58 +405,87 @@ void loadCertificates() {
 bool tryAlternativeUpdate(String url) {
   Serial.println("🔄 Attempting alternative update method...");
   
-  HTTPClient http;
-  http.begin(url);
-  http.setTimeout(30000); // 30 second timeout
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS); // Follow redirects
-  
-  int httpCode = http.GET();
-  Serial.printf("HTTP Response code: %d\n", httpCode);
-  
-  // Handle redirects
-  if (httpCode == HTTP_CODE_MOVED_PERMANENTLY || httpCode == HTTP_CODE_FOUND || httpCode == HTTP_CODE_TEMPORARY_REDIRECT) {
-    String newLocation = http.header("Location");
-    Serial.printf("Redirecting to: %s\n", newLocation.c_str());
-    http.end();
+  // For GitHub releases, try using HTTPClient with redirect handling
+  if (url.indexOf("github.com") != -1 && url.indexOf("releases/download") != -1) {
+    Serial.println("🔄 Trying HTTPClient with redirect handling...");
     
-    // Try the redirected URL
-    http.begin(newLocation);
+    HTTPClient http;
+    http.begin(url);
+    http.setTimeout(30000);
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-    httpCode = http.GET();
-    Serial.printf("Final HTTP Response code: %d\n", httpCode);
-  }
-  
-  if (httpCode == HTTP_CODE_OK) {
-    int contentLength = http.getSize();
-    Serial.printf("Content length: %d bytes\n", contentLength);
     
-    if (contentLength > 0) {
-      // Start the update
-      if (Update.begin(contentLength)) {
-        size_t written = Update.writeStream(http.getStream());
-        if (written == contentLength) {
-          if (Update.end()) {
-            Serial.println("✅ Alternative update completed successfully");
-            http.end();
-            return true;
+    int httpCode = http.GET();
+    Serial.printf("HTTP Response code: %d\n", httpCode);
+    
+    if (httpCode == HTTP_CODE_OK) {
+      int contentLength = http.getSize();
+      Serial.printf("Content length: %d bytes\n", contentLength);
+      
+      if (contentLength > 0) {
+        if (Update.begin(contentLength)) {
+          size_t written = Update.writeStream(http.getStream());
+          if (written == contentLength) {
+            if (Update.end()) {
+              Serial.println("✅ Alternative update completed successfully");
+              http.end();
+              return true;
+            } else {
+              Serial.printf("❌ Update end failed: %s\n", Update.errorString());
+            }
           } else {
-            Serial.printf("❌ Update end failed: %s\n", Update.errorString());
+            Serial.printf("❌ Written size mismatch. Expected: %d, Got: %d\n", contentLength, written);
           }
         } else {
-          Serial.printf("❌ Written size mismatch. Expected: %d, Got: %d\n", contentLength, written);
+          Serial.printf("❌ Update begin failed: %s\n", Update.errorString());
         }
       } else {
-        Serial.printf("❌ Update begin failed: %s\n", Update.errorString());
+        Serial.println("❌ Content length is 0");
       }
     } else {
-      Serial.println("❌ Content length is 0");
+      Serial.printf("❌ HTTP GET failed, error: %s\n", http.errorToString(httpCode).c_str());
     }
+    
+    http.end();
+    return false;
   } else {
-    Serial.printf("❌ HTTP GET failed, error: %s\n", http.errorToString(httpCode).c_str());
+    // For non-GitHub URLs, use HTTPClient
+    HTTPClient http;
+    http.begin(url);
+    http.setTimeout(30000);
+    int httpCode = http.GET();
+    Serial.printf("HTTP Response code: %d\n", httpCode);
+    
+    if (httpCode == HTTP_CODE_OK) {
+      int contentLength = http.getSize();
+      Serial.printf("Content length: %d bytes\n", contentLength);
+      
+      if (contentLength > 0) {
+        if (Update.begin(contentLength)) {
+          size_t written = Update.writeStream(http.getStream());
+          if (written == contentLength) {
+            if (Update.end()) {
+              Serial.println("✅ Alternative update completed successfully");
+              http.end();
+              return true;
+            } else {
+              Serial.printf("❌ Update end failed: %s\n", Update.errorString());
+            }
+          } else {
+            Serial.printf("❌ Written size mismatch. Expected: %d, Got: %d\n", contentLength, written);
+          }
+        } else {
+          Serial.printf("❌ Update begin failed: %s\n", Update.errorString());
+        }
+      } else {
+        Serial.println("❌ Content length is 0");
+      }
+    } else {
+      Serial.printf("❌ HTTP GET failed, error: %s\n", http.errorToString(httpCode).c_str());
+    }
+    
+    http.end();
+    return false;
   }
-  
-  http.end();
-  return false;
 }
 
 void setup() {
