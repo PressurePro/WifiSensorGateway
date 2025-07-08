@@ -14,13 +14,16 @@
 #include "config.h"
 
 #define WIFI_ANT_CONFIG 14
-#define AP_TIMEOUT_MS 2 * 60 * 1000
+#define AP_TIMEOUT_MS 15 * 60 * 1000
 #define DNS_PORT 53
 #define UART_RX 17
 #define UART_TX 18
 #define UART_BAUD 38400
 #define MQTT_BUFFER_SIZE 4096
 #define MAX_SENSOR_CACHE_SIZE 200
+#define MAX_PACKETS_PER_MINUTE 1000  // Rate limiting
+#define MAX_INVALID_PACKETS_PER_MINUTE 500  // Invalid packet rate limiting
+#define EMERGENCY_SHUTDOWN_INVALID_RATIO 0.8  // 80% invalid packets triggers shutdown
 
 String licenseKey = "";
 String deviceId = "";
@@ -41,6 +44,14 @@ unsigned long lastMqttReconnectAttempt = 0; // Track last MQTT reconnect
 bool debugMode = false; // Enable serial output to MQTT
 String debugBuffer = ""; // Buffer for debug messages
 unsigned long lastDebugPublish = 0; // Track last debug publish time
+unsigned long packetCount = 0; // Total packets received
+unsigned long invalidPacketCount = 0; // Invalid packets received
+unsigned long lastValidPacket = 0; // Last valid packet timestamp
+unsigned long packetsThisMinute = 0; // Rate limiting counter
+unsigned long invalidPacketsThisMinute = 0; // Invalid rate limiting counter
+unsigned long lastMinuteReset = 0; // Last time we reset minute counters
+bool emergencyShutdown = false; // Emergency shutdown flag
+unsigned long totalBytesReceived = 0; // Total bytes received (for debugging)
 
 struct SensorReading {
   std::string serialNumber;
@@ -123,6 +134,17 @@ void handleCommandMessage(String &topic, String &payload) {
       sensorCache.clear();
       Serial.println("✅ Sensor cache cleared");
     }
+    if (action == "reset_stats") {
+      Serial.println("📊 Resetting packet statistics...");
+      packetCount = 0;
+      invalidPacketCount = 0;
+      lastValidPacket = millis();
+      packetsThisMinute = 0;
+      invalidPacketsThisMinute = 0;
+      totalBytesReceived = 0;
+      emergencyShutdown = false;
+      Serial.println("✅ Packet statistics reset");
+    }
     if (action == "debug_mode") {
       if (doc.containsKey("enabled")) {
         debugMode = doc["enabled"].as<bool>();
@@ -137,6 +159,48 @@ void handleCommandMessage(String &topic, String &payload) {
         mqtt.publish(mqttBaseTopic() + "diagnostics", debugPayload);
       } else {
         Serial.println("❌ Debug mode command missing 'enabled' field");
+      }
+    }
+    if (action == "emergency_shutdown") {
+      if (doc.containsKey("enabled")) {
+        emergencyShutdown = doc["enabled"].as<bool>();
+        Serial.println(emergencyShutdown ? "🚨 Emergency shutdown ENABLED" : "🚨 Emergency shutdown DISABLED");
+        if (emergencyShutdown) {
+          // Send emergency alert
+          StaticJsonDocument<512> emergency;
+          emergency["type"] = "emergency_shutdown";
+          emergency["reason"] = "manual_trigger";
+          emergency["timestamp"] = String(millis());
+          
+          String emergencyPayload;
+          serializeJson(emergency, emergencyPayload);
+          mqtt.publish(mqttBaseTopic() + "diagnostics", emergencyPayload);
+          
+          // Disconnect MQTT
+          mqtt.disconnect();
+          
+          // Clear WiFi credentials and disconnect
+          Serial.println("🔌 Disconnecting WiFi and clearing credentials...");
+          prefs.begin("wifi", false);
+          prefs.clear();
+          prefs.end();
+          
+          // Reset global variables
+          licenseKey = "";
+          deviceId = "";
+          intervalMinutes = INTERVAL_MINUTES;
+          
+          // Disconnect from WiFi
+          WiFi.disconnect();
+          WiFi.mode(WIFI_OFF);
+          
+          Serial.println("✅ WiFi credentials cleared and disconnected");
+          
+          // Start AP mode for reconfiguration
+          startAPMode();
+        }
+      } else {
+        Serial.println("❌ Emergency shutdown command missing 'enabled' field");
       }
     }
   }
@@ -364,6 +428,17 @@ void publishSensorCache() {
   conn["ip_address"] = WiFi.localIP().toString();
   conn["connection_duration"] = (millis() - bootTime) / 1000;
   conn["readings_sent"] = ++readingsSent;
+  
+  // Add packet statistics
+  JsonObject packets = diag.createNestedObject("packets");
+  packets["total_received"] = packetCount;
+  packets["total_bytes"] = totalBytesReceived;
+  packets["invalid_count"] = invalidPacketCount;
+  packets["valid_sensors"] = sensorCache.size();
+  packets["last_valid_packet"] = (millis() - lastValidPacket) / 1000; // seconds ago
+  packets["rate_limit"] = packetsThisMinute;
+  packets["invalid_rate"] = invalidPacketsThisMinute;
+  packets["emergency_shutdown"] = emergencyShutdown;
 
   String diagPayload;
   serializeJson(diag, diagPayload);
@@ -599,8 +674,72 @@ void loop() {
 
   static uint8_t packet[9];
   static int index = 0;
+  
+  // Reset minute counters every minute
+  unsigned long now = millis();
+  if (now - lastMinuteReset >= 60000) { // 1 minute
+    packetsThisMinute = 0;
+    invalidPacketsThisMinute = 0;
+    lastMinuteReset = now;
+  }
+  
+  // Emergency shutdown check
+  if (packetsThisMinute > 0 && (float)invalidPacketsThisMinute / packetsThisMinute > EMERGENCY_SHUTDOWN_INVALID_RATIO) {
+    if (!emergencyShutdown) {
+      emergencyShutdown = true;
+      debugPrintln("🚨 EMERGENCY SHUTDOWN: Too many invalid packets (" + String(invalidPacketsThisMinute) + "/" + String(packetsThisMinute) + ")");
+      
+      // Send emergency alert
+      StaticJsonDocument<512> emergency;
+      emergency["type"] = "emergency_shutdown";
+      emergency["reason"] = "invalid_packet_flood";
+      emergency["invalid_ratio"] = (float)invalidPacketsThisMinute / packetsThisMinute;
+      emergency["invalid_count"] = invalidPacketsThisMinute;
+      emergency["total_count"] = packetsThisMinute;
+      emergency["timestamp"] = String(now);
+      
+      String emergencyPayload;
+      serializeJson(emergency, emergencyPayload);
+      mqtt.publish(mqttBaseTopic() + "diagnostics", emergencyPayload);
+      
+      // Disconnect MQTT to stop flooding
+      mqtt.disconnect();
+      
+      // Clear WiFi credentials and disconnect
+      debugPrintln("🔌 Disconnecting WiFi and clearing credentials...");
+      prefs.begin("wifi", false);
+      prefs.clear();
+      prefs.end();
+      
+      // Reset global variables
+      licenseKey = "";
+      deviceId = "";
+      intervalMinutes = INTERVAL_MINUTES;
+      
+      // Disconnect from WiFi
+      WiFi.disconnect();
+      WiFi.mode(WIFI_OFF);
+      
+      debugPrintln("✅ WiFi credentials cleared and disconnected");
+      
+      // Start AP mode for reconfiguration
+      startAPMode();
+    }
+    return; // Stop processing packets
+  }
+  
+  // Rate limiting check
+  if (packetsThisMinute >= MAX_PACKETS_PER_MINUTE) {
+    if (debugMode) {
+      debugPrintln("⚠️ Rate limit reached: " + String(packetsThisMinute) + " packets/minute");
+    }
+    return; // Stop processing packets this minute
+  }
+  
   while (Serial1.available()) {
     uint8_t b = Serial1.read();
+    totalBytesReceived++; // Count total bytes for debugging
+    
     // Debug: Print first few bytes to see what we're receiving
     static int debugCount = 0;
     
@@ -610,22 +749,83 @@ void loop() {
       if (debugCount % 10 == 0) debugPrintln("");
     }
     
-    if (index == 0 && (b != 0x80 && b != 0x84 && b != 0x88 && b != 0x90 && b != 0x98)) continue;
+    // Look for packet start
+    if (index == 0) {
+      if (b != 0x80 && b != 0x84 && b != 0x88 && b != 0x90 && b != 0x98) {
+        continue; // Not a valid start byte
+      }
+    }
+    
     packet[index++] = b;
+    
     if (index == 9) {
       index = 0;
+      packetCount++; // Only count complete 9-byte packets
+      packetsThisMinute++;
+      invalidPacketCount++;
+      invalidPacketsThisMinute++;
       
-      // Validate packet - check for reasonable values
+      // Enhanced packet validation
+      bool isValidPacket = true;
+      String validationErrors = "";
+      
+      // 1. Check for all-zero serial numbers
       if (packet[1] == 0x00 && packet[2] == 0x00 && packet[3] == 0x00) {
-        // Skip packets with all-zero serial numbers (likely corrupted)
+        isValidPacket = false;
+        validationErrors += "zero_serial ";
+      }
+      
+      // 2. Check for all-zero readings
+      if (packet[4] == 0x00 && packet[5] == 0x00) {
+        isValidPacket = false;
+        validationErrors += "zero_readings ";
+      }
+      
+      // 3. Check for all-FF values (common corruption pattern)
+      if (packet[1] == 0xFF && packet[2] == 0xFF && packet[3] == 0xFF) {
+        isValidPacket = false;
+        validationErrors += "ff_serial ";
+      }
+      
+      // 4. Check for reasonable pressure range (assuming 0-255 PSI)
+      if (packet[4] > 200) { // Unrealistic pressure
+        isValidPacket = false;
+        validationErrors += "high_pressure ";
+      }
+      
+      // 5. Check for reasonable temperature range (assuming -40 to +125°C)
+      if (packet[5] > 200) { // Unrealistic temperature
+        isValidPacket = false;
+        validationErrors += "high_temp ";
+      }
+      
+      // 6. Check RSSI range (should be 0-255)
+      if (packet[6] > 255) {
+        isValidPacket = false;
+        validationErrors += "invalid_rssi ";
+      }
+      
+      // 7. Check ambient range (should be 0-255)
+      if (packet[7] > 255) {
+        isValidPacket = false;
+        validationErrors += "invalid_ambient ";
+      }
+      
+      if (!isValidPacket) {
+        if (debugMode) {
+          debugPrintln("❌ Invalid packet: " + validationErrors + " | " + 
+                      String(packet[0], HEX) + " " + String(packet[1], HEX) + " " + 
+                      String(packet[2], HEX) + " " + String(packet[3], HEX) + " " + 
+                      String(packet[4], HEX) + " " + String(packet[5], HEX) + " " + 
+                      String(packet[6], HEX) + " " + String(packet[7], HEX) + " " + 
+                      String(packet[8], HEX));
+        }
         continue;
       }
       
-      // Check for reasonable pressure/temperature values
-      if (packet[4] == 0x00 && packet[5] == 0x00) {
-        // Skip packets with all-zero readings (likely corrupted)
-        continue;
-      }
+      // Packet is valid!
+      lastValidPacket = millis();
+      invalidPacketCount = 0; // Reset invalid count on valid packet
       
       char serialHex[7];
       sprintf(serialHex, "%02X%02X%02X", packet[1], packet[2], packet[3]);
