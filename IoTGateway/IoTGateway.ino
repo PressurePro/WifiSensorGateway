@@ -24,6 +24,8 @@
 #define MAX_PACKETS_PER_MINUTE 1000  // Rate limiting
 #define MAX_INVALID_PACKETS_PER_MINUTE 500  // Invalid packet rate limiting
 #define EMERGENCY_SHUTDOWN_INVALID_RATIO 0.8  // 80% invalid packets triggers shutdown
+#define RECOVERY_PIN 0  // GPIO0 - Boot button on most ESP32 boards
+#define MAX_EMERGENCY_SHUTDOWNS 3  // Max emergency shutdowns before permanent disable
 
 String licenseKey = "";
 String deviceId = "";
@@ -52,6 +54,8 @@ unsigned long invalidPacketsThisMinute = 0; // Invalid rate limiting counter
 unsigned long lastMinuteReset = 0; // Last time we reset minute counters
 bool emergencyShutdown = false; // Emergency shutdown flag
 unsigned long totalBytesReceived = 0; // Total bytes received (for debugging)
+unsigned long emergencyShutdownCount = 0; // Count of emergency shutdowns
+bool emergencyProtectionDisabled = false; // Permanent disable flag
 
 struct SensorReading {
   std::string serialNumber;
@@ -202,6 +206,21 @@ void handleCommandMessage(String &topic, String &payload) {
       } else {
         Serial.println("❌ Emergency shutdown command missing 'enabled' field");
       }
+    }
+    if (action == "disable_emergency_protection") {
+      emergencyProtectionDisabled = true;
+      saveEmergencyShutdownCount();
+      Serial.println("🚨 Emergency protection DISABLED permanently");
+      
+      // Send alert
+      StaticJsonDocument<512> disableAlert;
+      disableAlert["type"] = "emergency_protection_disabled";
+      disableAlert["reason"] = "manual_disable";
+      disableAlert["timestamp"] = String(millis());
+      
+      String disablePayload;
+      serializeJson(disableAlert, disablePayload);
+      mqtt.publish(mqttBaseTopic() + "diagnostics", disablePayload);
     }
   }
 }
@@ -439,6 +458,8 @@ void publishSensorCache() {
   packets["rate_limit"] = packetsThisMinute;
   packets["invalid_rate"] = invalidPacketsThisMinute;
   packets["emergency_shutdown"] = emergencyShutdown;
+  packets["emergency_shutdown_count"] = emergencyShutdownCount;
+  packets["emergency_protection_disabled"] = emergencyProtectionDisabled;
 
   String diagPayload;
   serializeJson(diag, diagPayload);
@@ -625,11 +646,79 @@ void debugPrintln(const String& message) {
   sendDebugMessage(message + "\n");
 }
 
+void checkHardwareRecovery() {
+  // Check if recovery pin is held down (GPIO0 pulled low)
+  pinMode(RECOVERY_PIN, INPUT_PULLUP);
+  delay(100); // Debounce
+  
+  if (digitalRead(RECOVERY_PIN) == LOW) {
+    Serial.println("🔧 HARDWARE RECOVERY TRIGGERED - Holding boot button detected");
+    
+    // Flash LED to indicate recovery mode
+    pinMode(LED_BUILTIN, OUTPUT);
+    for (int i = 0; i < 10; i++) {
+      digitalWrite(LED_BUILTIN, HIGH);
+      delay(200);
+      digitalWrite(LED_BUILTIN, LOW);
+      delay(200);
+    }
+    
+    // Clear all preferences
+    prefs.begin("wifi", false);
+    prefs.clear();
+    prefs.end();
+    
+    prefs.begin("certs", false);
+    prefs.clear();
+    prefs.end();
+    
+    // Reset all counters and flags
+    emergencyShutdownCount = 0;
+    emergencyProtectionDisabled = false;
+    emergencyShutdown = false;
+    packetsThisMinute = 0;
+    invalidPacketsThisMinute = 0;
+    packetCount = 0;
+    invalidPacketCount = 0;
+    totalBytesReceived = 0;
+    
+    Serial.println("✅ FACTORY RESET COMPLETE - Rebooting...");
+    delay(2000);
+    ESP.restart();
+  }
+}
+
+void loadEmergencyShutdownCount() {
+  prefs.begin("emergency", true);
+  emergencyShutdownCount = prefs.getULong("shutdown_count", 0);
+  emergencyProtectionDisabled = prefs.getBool("protection_disabled", false);
+  prefs.end();
+}
+
+void saveEmergencyShutdownCount() {
+  prefs.begin("emergency", false);
+  prefs.putULong("shutdown_count", emergencyShutdownCount);
+  prefs.putBool("protection_disabled", emergencyProtectionDisabled);
+  prefs.end();
+}
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
   esp_log_level_set("*", ESP_LOG_NONE); // Stops verbose serial logging, if it happens
   bootTime = millis();
+  
+  // Load emergency shutdown count from persistent storage
+  loadEmergencyShutdownCount();
+  
+  // Check for hardware recovery (boot button held down)
+  checkHardwareRecovery();
+  
+  // Reset emergency shutdown state and counters on boot
+  emergencyShutdown = false;
+  packetsThisMinute = 0;
+  invalidPacketsThisMinute = 0;
+  lastMinuteReset = millis();
   
   debugPrintln("🚀 IoT Gateway starting up...");
 
@@ -651,6 +740,9 @@ void setup() {
   connectMQTT();
   Serial1.begin(UART_BAUD, SERIAL_8N1, UART_RX, UART_TX);
   Serial.println("🛰️  Listening for TPMS packets...");
+  
+  // Give system time to stabilize before processing packets
+  delay(2000);
 }
 
 void loop() {
@@ -683,10 +775,44 @@ void loop() {
     lastMinuteReset = now;
   }
   
-  // Emergency shutdown check
-  if (packetsThisMinute > 0 && (float)invalidPacketsThisMinute / packetsThisMinute > EMERGENCY_SHUTDOWN_INVALID_RATIO) {
+  // Emergency shutdown check - only trigger if we have enough packets to make a meaningful assessment
+  // Also add a grace period after boot to prevent immediate shutdown
+  // Skip if emergency protection is permanently disabled
+  if (!emergencyProtectionDisabled && 
+      packetsThisMinute >= 10 && 
+      (float)invalidPacketsThisMinute / packetsThisMinute > EMERGENCY_SHUTDOWN_INVALID_RATIO &&
+      (millis() - bootTime) > 30000) { // 30 second grace period after boot
+    if (debugMode) {
+      debugPrintln("⚠️ Emergency shutdown conditions met: " + String(packetsThisMinute) + " packets, " + 
+                  String(invalidPacketsThisMinute) + " invalid, ratio: " + 
+                  String((float)invalidPacketsThisMinute / packetsThisMinute, 2));
+    }
     if (!emergencyShutdown) {
       emergencyShutdown = true;
+      emergencyShutdownCount++;
+      saveEmergencyShutdownCount();
+      
+      // Check if we've exceeded the maximum emergency shutdowns
+      if (emergencyShutdownCount >= MAX_EMERGENCY_SHUTDOWNS) {
+        emergencyProtectionDisabled = true;
+        saveEmergencyShutdownCount();
+        debugPrintln("🚨 EMERGENCY PROTECTION PERMANENTLY DISABLED - Too many shutdowns (" + String(emergencyShutdownCount) + ")");
+        
+        // Send alert about permanent disable
+        StaticJsonDocument<512> disableAlert;
+        disableAlert["type"] = "emergency_protection_disabled";
+        disableAlert["reason"] = "too_many_shutdowns";
+        disableAlert["shutdown_count"] = emergencyShutdownCount;
+        disableAlert["timestamp"] = String(millis());
+        
+        String disablePayload;
+        serializeJson(disableAlert, disablePayload);
+        mqtt.publish(mqttBaseTopic() + "diagnostics", disablePayload);
+        
+        // Don't actually shutdown, just disable protection
+        emergencyShutdown = false;
+        return;
+      }
       debugPrintln("🚨 EMERGENCY SHUTDOWN: Too many invalid packets (" + String(invalidPacketsThisMinute) + "/" + String(packetsThisMinute) + ")");
       
       // Send emergency alert
@@ -787,17 +913,11 @@ void loop() {
         validationErrors += "ff_serial ";
       }
       
-      // 4. Check for reasonable pressure range (assuming 0-255 PSI)
-      if (packet[4] > 200) { // Unrealistic pressure
-        isValidPacket = false;
-        validationErrors += "high_pressure ";
-      }
+      // 4. Check for reasonable pressure range (0-255 PSI is valid)
+      // Removed overly strict pressure validation - let all values through
       
-      // 5. Check for reasonable temperature range (assuming -40 to +125°C)
-      if (packet[5] > 200) { // Unrealistic temperature
-        isValidPacket = false;
-        validationErrors += "high_temp ";
-      }
+      // 5. Check for reasonable temperature range (0-255°C is valid)
+      // Removed overly strict temperature validation - let all values through
       
       // 6. Check RSSI range (should be 0-255)
       if (packet[6] > 255) {
