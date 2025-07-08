@@ -38,6 +38,9 @@ unsigned long readingsSent = 0;
 bool inApMode = false;
 unsigned long lastPublishTime = 0;
 unsigned long lastMqttReconnectAttempt = 0; // Track last MQTT reconnect
+bool debugMode = false; // Enable serial output to MQTT
+String debugBuffer = ""; // Buffer for debug messages
+unsigned long lastDebugPublish = 0; // Track last debug publish time
 
 struct SensorReading {
   std::string serialNumber;
@@ -119,6 +122,22 @@ void handleCommandMessage(String &topic, String &payload) {
       Serial.println("🗑️ Clearing sensor cache...");
       sensorCache.clear();
       Serial.println("✅ Sensor cache cleared");
+    }
+    if (action == "debug_mode") {
+      if (doc.containsKey("enabled")) {
+        debugMode = doc["enabled"].as<bool>();
+        Serial.println(debugMode ? "🐛 Debug mode ENABLED" : "🐛 Debug mode DISABLED");
+        // Send immediate confirmation
+        StaticJsonDocument<256> debugMsg;
+        debugMsg["type"] = "debug_mode_change";
+        debugMsg["enabled"] = debugMode;
+        debugMsg["timestamp"] = String(millis());
+        String debugPayload;
+        serializeJson(debugMsg, debugPayload);
+        mqtt.publish(mqttBaseTopic() + "diagnostics", debugPayload);
+      } else {
+        Serial.println("❌ Debug mode command missing 'enabled' field");
+      }
     }
   }
 }
@@ -313,7 +332,9 @@ void publishSensorCache() {
   time_t now;
   time(&now);
 
-  doc["timestamp"] = String(ctime(&now)).c_str();
+  String timestamp = String(ctime(&now));
+  timestamp.trim(); // Remove trailing newline
+  doc["timestamp"] = timestamp.c_str();
   doc["unix_time"] = now * 1000UL;
   JsonArray data = doc.createNestedArray("sensor_data");
   for (auto& kv : sensorCache) {
@@ -488,13 +509,54 @@ bool tryAlternativeUpdate(String url) {
   }
 }
 
+void sendDebugMessage(const String& message) {
+  if (!debugMode || !mqtt.connected()) return;
+  
+  // Add message to buffer
+  debugBuffer += message;
+  
+  // Send buffer if it's getting large or enough time has passed
+  unsigned long now = millis();
+  if (debugBuffer.length() > 500 || (now - lastDebugPublish > 5000)) {
+    flushDebugBuffer();
+  }
+}
+
+void flushDebugBuffer() {
+  if (debugBuffer.isEmpty() || !mqtt.connected()) return;
+  
+  StaticJsonDocument<1024> debugMsg;
+  debugMsg["type"] = "serial_output";
+  debugMsg["message"] = debugBuffer;
+  debugMsg["timestamp"] = String(millis());
+  debugMsg["device_id"] = deviceId;
+  
+  String debugPayload;
+  serializeJson(debugMsg, debugPayload);
+  mqtt.publish(mqttBaseTopic() + "diagnostics", debugPayload);
+  
+  debugBuffer = "";
+  lastDebugPublish = millis();
+}
+
+// Override Serial.print to capture debug output
+void debugPrint(const String& message) {
+  Serial.print(message);
+  sendDebugMessage(message);
+}
+
+void debugPrintln(const String& message) {
+  Serial.println(message);
+  sendDebugMessage(message + "\n");
+}
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
   esp_log_level_set("*", ESP_LOG_NONE); // Stops verbose serial logging, if it happens
   bootTime = millis();
   
-  Serial.println("🚀 IoT Gateway starting up...");
+  debugPrintln("🚀 IoT Gateway starting up...");
 
   if (!tryWiFiConnection()) {
     startAPMode();
@@ -543,9 +605,9 @@ void loop() {
     static int debugCount = 0;
     
     if (debugCount < 20) {
-      Serial.printf("%02X", b);
+      debugPrint(String(b, HEX));
       debugCount++;
-      if (debugCount % 10 == 0) Serial.println();
+      if (debugCount % 10 == 0) debugPrintln("");
     }
     
     if (index == 0 && (b != 0x80 && b != 0x84 && b != 0x88 && b != 0x90 && b != 0x98)) continue;
@@ -573,7 +635,7 @@ void loop() {
         // Remove the oldest sensor (first in map)
         String oldestSensor = sensorCache.begin()->second.serialNumber.c_str();
         sensorCache.erase(sensorCache.begin());
-        Serial.println("🗑️ Removed sensor " + oldestSensor + " from cache (limit: " + String(MAX_SENSOR_CACHE_SIZE) + ")");
+        debugPrintln("🗑️ Removed sensor " + oldestSensor + " from cache (limit: " + String(MAX_SENSOR_CACHE_SIZE) + ")");
       }
       
       SensorReading reading = {
@@ -588,7 +650,7 @@ void loop() {
   }
 
   if (millis() - lastPublishTime >= intervalMinutes * 60UL * 1000UL) {
-    Serial.println("Sending Cache!");
+    debugPrintln("Sending Cache!");
     publishSensorCache();
   }
 }
