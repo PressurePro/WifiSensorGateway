@@ -1,6 +1,6 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
-#include <MQTTClient.h>
+#include <PubSubClient.h>
 #include <Preferences.h>
 #include <WebServer.h>
 #include <DNSServer.h>
@@ -19,7 +19,7 @@
 #define UART_RX 17
 #define UART_TX 18
 #define UART_BAUD 38400
-#define MQTT_BUFFER_SIZE 4096
+#define MQTT_BUFFER_SIZE 16384
 #define MAX_SENSOR_CACHE_SIZE 200
 #define MAX_PACKETS_PER_MINUTE 1000  // Rate limiting
 #define MAX_INVALID_PACKETS_PER_MINUTE 500  // Invalid packet rate limiting
@@ -36,13 +36,16 @@ Preferences prefs;
 WebServer server(80);
 DNSServer dns;
 WiFiClientSecure net;
-MQTTClient mqtt(MQTT_BUFFER_SIZE);
+PubSubClient mqtt(net);
 
 unsigned long bootTime;
 unsigned long readingsSent = 0;
 bool inApMode = false;
 unsigned long lastPublishTime = 0;
 unsigned long lastMqttReconnectAttempt = 0; // Track last MQTT reconnect
+bool mqttConnecting = false; // Prevent multiple simultaneous connection attempts
+bool deviceProvisioned = false; // Track if device has been provisioned with unique certificate
+bool provisioningAttempted = false; // Track if we've already attempted provisioning this session
 bool debugMode = false; // Enable serial output to MQTT
 String debugBuffer = ""; // Buffer for debug messages
 unsigned long lastDebugPublish = 0; // Track last debug publish time
@@ -160,7 +163,9 @@ void handleCommandMessage(String &topic, String &payload) {
         debugMsg["timestamp"] = String(millis());
         String debugPayload;
         serializeJson(debugMsg, debugPayload);
-        mqtt.publish(mqttBaseTopic() + "diagnostics", debugPayload);
+        String topic = mqttBaseTopic() + "diagnostics";
+        Serial.println("📤 Publishing to topic: " + topic);
+        mqtt.publish(topic.c_str(), debugPayload.c_str());
       } else {
         Serial.println("❌ Debug mode command missing 'enabled' field");
       }
@@ -178,7 +183,9 @@ void handleCommandMessage(String &topic, String &payload) {
           
           String emergencyPayload;
           serializeJson(emergency, emergencyPayload);
-          mqtt.publish(mqttBaseTopic() + "diagnostics", emergencyPayload);
+          String topic = mqttBaseTopic() + "diagnostics";
+          Serial.println("📤 Publishing to topic: " + topic);
+          mqtt.publish(topic.c_str(), emergencyPayload.c_str());
           
           // Disconnect MQTT
           mqtt.disconnect();
@@ -220,7 +227,9 @@ void handleCommandMessage(String &topic, String &payload) {
       
       String disablePayload;
       serializeJson(disableAlert, disablePayload);
-      mqtt.publish(mqttBaseTopic() + "diagnostics", disablePayload);
+      String topic = mqttBaseTopic() + "diagnostics";
+      Serial.println("📤 Publishing to topic: " + topic);
+      mqtt.publish(topic.c_str(), disablePayload.c_str());
     }
     if (action == "debug_packets") {
       if (doc.containsKey("enabled")) {
@@ -324,23 +333,329 @@ void handleFirmwareMessage(String &topic, String &payload) {
   performFirmwareUpdate(url);
 }
 
-void messageReceived(String &topic, String &payload) {
-  if (topic.endsWith("commands")) handleCommandMessage(topic, payload);
-  else if (topic.endsWith("firmware")) handleFirmwareMessage(topic, payload);
+void handleProvisioningResponse(String &topic, String &payload) {
+  Serial.println("📥 Received provisioning response");
+  
+  StaticJsonDocument<2048> doc;
+  if (deserializeJson(doc, payload)) {
+    Serial.println("❌ Failed to parse provisioning response");
+    return;
+  }
+  
+  if (doc.containsKey("status") && doc["status"] == "success") {
+    if (doc.containsKey("certificates")) {
+      JsonObject certs = doc["certificates"];
+      
+      if (certs.containsKey("rootca") && certs.containsKey("devicecert") && certs.containsKey("privatekey")) {
+        String rootCA = certs["rootca"].as<String>();
+        String deviceCert = certs["devicecert"].as<String>();
+        String privateKey = certs["privatekey"].as<String>();
+        
+        // Store the new certificates
+        prefs.begin("certs", false);
+        prefs.putString("rootca", rootCA);
+        prefs.putString("devicecert", deviceCert);
+        prefs.putString("privatekey", privateKey);
+        prefs.end();
+        
+        Serial.println("✅ New certificates stored successfully");
+        
+        // Disconnect and reconnect with new certificates
+        mqtt.disconnect();
+        delay(1000);
+        
+        // Load the new certificates
+        loadCertificates();
+        
+        // Give AWS IoT time to activate the new certificates
+        Serial.println("⏳ Waiting 5 seconds for AWS IoT to activate new certificates...");
+        delay(5000);
+        
+        // Test connection with new certificates
+        Serial.println("🧪 Testing connection with new certificates...");
+        connectMQTT();
+        
+        // If connection fails, try with provisioning certificates to verify the issue
+        if (!mqtt.connected()) {
+          Serial.println("❌ Connection with new certificates failed, testing with provisioning certificates...");
+          
+          // Temporarily switch back to provisioning certificates
+          net.setCACert(::rootCA);  // Use global embedded certificates
+          net.setCertificate(::deviceCert);
+          net.setPrivateKey(::privateKey);
+          
+          // Try connecting with provisioning certificates
+          String testClientId = "esp32c6-" + getHardwareId();
+          Serial.println("🧪 Testing with provisioning certificates, client ID: " + testClientId);
+          
+          mqtt.setServer(AWS_IOT_ENDPOINT, 8883);
+          mqtt.setCallback(messageReceived);
+          mqtt.setKeepAlive(60);
+          mqtt.setBufferSize(MQTT_BUFFER_SIZE);
+          mqtt.setSocketTimeout(30);
+          
+          bool testConnect = mqtt.connect(testClientId.c_str());
+          Serial.println("🧪 Provisioning certificate test result: " + String(testConnect ? "SUCCESS" : "FAILED"));
+          Serial.println("🧪 MQTT state: " + String(mqtt.state()));
+          
+          // Switch back to provisioned certificates
+          loadCertificates();
+        }
+        
+        deviceProvisioned = true;
+        Serial.println("🎉 Device provisioning completed successfully!");
+      } else {
+        Serial.println("❌ Provisioning response missing certificate data");
+      }
+    } else {
+      Serial.println("❌ Provisioning response missing certificates");
+    }
+  } else {
+    Serial.println("❌ Provisioning failed: " + (doc.containsKey("error") ? doc["error"].as<String>() : "Unknown error"));
+  }
+}
+
+void messageReceived(char* topic, byte* payload, unsigned int length) {
+  String topicStr = String(topic);
+  String payloadStr = "";
+  for (int i = 0; i < length; i++) {
+    payloadStr += (char)payload[i];
+  }
+  
+  Serial.println("📥 MQTT message received:");
+  Serial.println("   Topic: " + topicStr);
+  Serial.println("   Payload length: " + String(length) + " bytes");
+  Serial.println("   Payload: " + payloadStr.substring(0, min(200, (int)payloadStr.length())) + (payloadStr.length() > 200 ? "..." : ""));
+  
+  if (topicStr.endsWith("commands")) handleCommandMessage(topicStr, payloadStr);
+  else if (topicStr.endsWith("firmware")) handleFirmwareMessage(topicStr, payloadStr);
+  else if (topicStr.indexOf("/provisioning/") != -1) handleProvisioningResponse(topicStr, payloadStr);
 }
 
 void connectMQTT() {
-  mqtt.begin(AWS_IOT_ENDPOINT, 8883, net);
-  mqtt.onMessage(messageReceived);
-
-  while (!mqtt.connect("esp32c6-client")) {
-    Serial.print(".");
-    delay(500);
+  Serial.println("🔗 Connecting to MQTT broker: " + String(AWS_IOT_ENDPOINT));
+  
+  // Clear any existing connection
+  if (mqtt.connected()) {
+    mqtt.disconnect();
+    delay(1000);
   }
-  Serial.println("\n✅ MQTT connected!");
-  mqtt.subscribe(mqttBaseTopic() + "commands");
-  mqtt.subscribe(mqttBaseTopic() + "firmware");
-  mqtt.subscribe("pressurepro/devices/WifiSensorGateway/firmware");
+  
+  // Set up PubSubClient
+  mqtt.setServer(AWS_IOT_ENDPOINT, 8883);
+  mqtt.setCallback(messageReceived);
+  mqtt.setKeepAlive(60); // 60 second keepalive (more stable)
+  mqtt.setBufferSize(MQTT_BUFFER_SIZE);
+  mqtt.setSocketTimeout(30); // 30 second socket timeout (more generous)
+
+  // Generate unique client ID using MAC address
+  String clientId = "esp32c6-" + getHardwareId();
+  
+  // If using provisioned certificates, try a simpler client ID
+  if (deviceProvisioned) {
+    clientId = "esp32c6-test"; // Use a simple client ID for testing
+    Serial.println("🔑 Using simple client ID for provisioned certificates: " + clientId);
+  } else {
+    Serial.println("🔑 Using full client ID for provisioning: " + clientId);
+  }
+  
+  Serial.println("🔑 Client ID matches policy pattern: " + String(clientId.startsWith("esp32c6-") ? "YES" : "NO"));
+  
+  int attempts = 0;
+  while (!mqtt.connect(clientId.c_str()) && attempts < 10) {
+    Serial.print(".");
+    Serial.print("(attempt " + String(attempts + 1) + ", heap: " + String(ESP.getFreeHeap()) + ")");
+    Serial.print(" MQTT state: " + String(mqtt.state()));
+    
+    // Add more detailed error information
+    if (mqtt.state() == -2) {
+      Serial.print(" (Connection refused - check certificate/policy)");
+    } else if (mqtt.state() == -3) {
+      Serial.print(" (Server unavailable)");
+    } else if (mqtt.state() == -4) {
+      Serial.print(" (Bad username/password)");
+    } else if (mqtt.state() == -5) {
+      Serial.print(" (Not authorized)");
+    }
+    
+    delay(1000);
+    attempts++;
+  }
+  
+  if (mqtt.connected()) {
+    Serial.println("\n✅ MQTT connected successfully!");
+    Serial.println("🔍 MQTT client state check: " + String(mqtt.connected() ? "CONNECTED" : "DISCONNECTED"));
+    
+    // Wait a moment and check if connection is still stable
+    delay(2000);
+    Serial.println("🔍 MQTT client state after delay: " + String(mqtt.connected() ? "CONNECTED" : "DISCONNECTED"));
+    if (mqtt.connected()) {
+      mqtt.subscribe((mqttBaseTopic() + "commands").c_str());
+      mqtt.subscribe((mqttBaseTopic() + "firmware").c_str());
+      mqtt.subscribe("pressurepro/devices/WifiSensorGateway/firmware");
+      Serial.println("📡 Subscribed to MQTT topics");
+      
+      // If using provisioning certificates, send provisioning request
+      Serial.println("🔍 Device provisioned status: " + String(deviceProvisioned ? "YES" : "NO"));
+      Serial.println("🔍 Provisioning attempted: " + String(provisioningAttempted ? "YES" : "NO"));
+      if (!deviceProvisioned && !provisioningAttempted) {
+        Serial.println("📤 Sending provisioning request...");
+        provisioningAttempted = true; // Mark that we've attempted provisioning
+        
+        // Test publish to diagnostics topic to verify permissions
+        Serial.println("🧪 Testing publish to diagnostics topic...");
+        String testTopic = mqttBaseTopic() + "diagnostics";
+        Serial.println("🧪 Test topic: " + testTopic);
+        StaticJsonDocument<256> testMsg;
+        testMsg["type"] = "test_message";
+        testMsg["message"] = "Testing MQTT publish capability";
+        testMsg["timestamp"] = String(millis());
+        String testPayload;
+        serializeJson(testMsg, testPayload);
+        Serial.println("🧪 Test payload: " + testPayload);
+        bool testPublish = mqtt.publish(testTopic.c_str(), testPayload.c_str());
+        Serial.println("🧪 Test publish result: " + String(testPublish ? "SUCCESS" : "FAILED"));
+        Serial.println("🧪 MQTT state after test publish: " + String(mqtt.state()));
+        Serial.println("🧪 MQTT connected check: " + String(mqtt.connected() ? "YES" : "NO"));
+        
+        // Wait a moment and check again
+        delay(100);
+        Serial.println("🧪 MQTT state after delay: " + String(mqtt.state()));
+        Serial.println("🧪 MQTT connected check after delay: " + String(mqtt.connected() ? "YES" : "NO"));
+        
+        // If connection dropped, try to reconnect
+        if (!mqtt.connected()) {
+          Serial.println("⚠️ MQTT connection dropped after first publish, reconnecting...");
+          mqtt.disconnect();
+          delay(1000);
+          
+          String clientId = "esp32c6-" + getHardwareId();
+          int reconnectAttempts = 0;
+          while (!mqtt.connect(clientId.c_str()) && reconnectAttempts < 3) {
+            Serial.print(".");
+            delay(1000);
+            reconnectAttempts++;
+          }
+          
+          if (mqtt.connected()) {
+            Serial.println("\n✅ MQTT reconnected for second test");
+          } else {
+            Serial.println("\n❌ Failed to reconnect for second test");
+            return;
+          }
+        }
+        
+        // Test publish to provisioning topic directly
+        Serial.println("🧪 Testing publish to provisioning topic directly...");
+        String provisioningTestTopic = "pressurepro/devices/WifiSensorGateway/provisioning/request";
+        Serial.println("🧪 Provisioning test topic: " + provisioningTestTopic);
+        StaticJsonDocument<256> provisioningTestMsg;
+        provisioningTestMsg["type"] = "test_provisioning";
+        provisioningTestMsg["message"] = "Testing provisioning topic publish";
+        provisioningTestMsg["timestamp"] = String(millis());
+        String provisioningTestPayload;
+        serializeJson(provisioningTestMsg, provisioningTestPayload);
+        Serial.println("🧪 Provisioning test payload: " + provisioningTestPayload);
+        bool provisioningTestPublish = mqtt.publish(provisioningTestTopic.c_str(), provisioningTestPayload.c_str());
+        Serial.println("🧪 Provisioning test publish result: " + String(provisioningTestPublish ? "SUCCESS" : "FAILED"));
+        Serial.println("🧪 MQTT state after provisioning test publish: " + String(mqtt.state()));
+        Serial.println("🧪 MQTT connected check after provisioning test: " + String(mqtt.connected() ? "YES" : "NO"));
+        delay(1000);
+        
+        // Check MQTT connection and reconnect if needed
+        Serial.println("🔍 Checking MQTT connection before provisioning request...");
+        Serial.println("🔍 MQTT state: " + String(mqtt.state()) + ", Connected: " + String(mqtt.connected() ? "YES" : "NO"));
+        
+        if (!mqtt.connected()) {
+          Serial.println("⚠️ MQTT disconnected before provisioning request, reconnecting...");
+          mqtt.disconnect();
+          delay(1000);
+          
+          // Reconnect
+          String clientId = "esp32c6-" + getHardwareId();
+          int reconnectAttempts = 0;
+          while (!mqtt.connect(clientId.c_str()) && reconnectAttempts < 5) {
+            Serial.print(".");
+            delay(1000);
+            reconnectAttempts++;
+          }
+          
+          if (mqtt.connected()) {
+            Serial.println("\n✅ MQTT reconnected successfully!");
+            // Resubscribe to topics
+            mqtt.subscribe((mqttBaseTopic() + "commands").c_str());
+            mqtt.subscribe((mqttBaseTopic() + "firmware").c_str());
+            mqtt.subscribe("pressurepro/devices/WifiSensorGateway/firmware");
+          } else {
+            Serial.println("\n❌ Failed to reconnect MQTT");
+            return;
+          }
+        }
+        
+        // Subscribe to provisioning response topic
+        String provisioningTopic = "pressurepro/devices/WifiSensorGateway/provisioning/" + licenseKey + "/response";
+        Serial.println("📡 Subscribing to response topic: " + provisioningTopic);
+        bool subscribeResult = mqtt.subscribe(provisioningTopic.c_str());
+        Serial.println("📡 Subscribe result: " + String(subscribeResult ? "SUCCESS" : "FAILED"));
+        
+        // Send provisioning request
+        StaticJsonDocument<512> request;
+        request["type"] = "provisioning_request";
+        request["device_id"] = licenseKey; // Use license key as device identifier
+        request["hardware_model"] = "ESP32-C6";
+        request["firmware_version"] = firmwareVersion;
+        request["client_id"] = "esp32c6-" + getHardwareId(); // Include the exact client ID
+        request["timestamp"] = String(millis());
+        
+        Serial.println("🔍 JSON creation debug:");
+        Serial.println("   type: " + String(request["type"].as<const char*>()));
+        Serial.println("   device_id: " + String(request["device_id"].as<const char*>()));
+        Serial.println("   hardware_model: " + String(request["hardware_model"].as<const char*>()));
+        Serial.println("   firmware_version: " + String(request["firmware_version"].as<const char*>()));
+        Serial.println("   timestamp: " + String(request["timestamp"].as<const char*>()));
+        
+        String requestPayload;
+        serializeJson(request, requestPayload);
+        
+        String requestTopic = "pressurepro/devices/WifiSensorGateway/provisioning/request";
+        Serial.println("📤 Publishing to topic: " + requestTopic);
+        Serial.println("📤 Request payload: " + requestPayload);
+        Serial.println("📤 Payload length: " + String(requestPayload.length()) + " bytes");
+        Serial.println("📤 Free heap before publish: " + String(ESP.getFreeHeap()) + " bytes");
+        Serial.println("📤 MQTT connected state before publish: " + String(mqtt.connected() ? "YES" : "NO"));
+        bool publishResult = mqtt.publish(requestTopic.c_str(), requestPayload.c_str());
+        
+        if (publishResult) {
+          Serial.println("📤 Provisioning request sent successfully");
+          Serial.println("📤 MQTT state after publish: " + String(mqtt.state()));
+          Serial.println("⏳ Waiting for certificate response...");
+          
+          // Wait for response (with timeout)
+          unsigned long startTime = millis();
+          while (millis() - startTime < 30000) { // 30 second timeout
+            mqtt.loop();
+            delay(100);
+            
+            if (deviceProvisioned) {
+              Serial.println("✅ Device successfully provisioned!");
+              return; // Exit the function to reconnect with new certificates
+            }
+          }
+          
+          Serial.println("❌ Provisioning timeout - no response received");
+        } else {
+          Serial.println("❌ Failed to send provisioning request");
+        }
+      }
+    } else {
+      Serial.println("❌ MQTT connection dropped immediately after connect");
+    }
+  } else {
+    Serial.println("\n❌ MQTT connection failed after " + String(attempts) + " attempts");
+    Serial.println("🔍 Debug info - WiFi status: " + String(WiFi.status()) + 
+                  ", RSSI: " + String(WiFi.RSSI()) + 
+                  ", IP: " + WiFi.localIP().toString());
+  }
 }
 
 bool tryWiFiConnection() {
@@ -447,7 +762,9 @@ void publishSensorCache() {
 
   String payload;
   serializeJson(doc, payload);
-  mqtt.publish(mqttBaseTopic() + "sensor-readings", payload);
+  String sensorTopic = mqttBaseTopic() + "sensor-readings";
+  Serial.println("📤 Publishing to topic: " + sensorTopic);
+  mqtt.publish(sensorTopic.c_str(), payload.c_str());
 
   // Diagnostics
   StaticJsonDocument<512> diag;
@@ -474,7 +791,9 @@ void publishSensorCache() {
 
   String diagPayload;
   serializeJson(diag, diagPayload);
-  mqtt.publish(mqttBaseTopic() + "diagnostics", diagPayload);
+  String diagTopic = mqttBaseTopic() + "diagnostics";
+  Serial.println("📤 Publishing to topic: " + diagTopic);
+  mqtt.publish(diagTopic.c_str(), diagPayload.c_str());
 
   sensorCache.clear();
   lastPublishTime = millis();
@@ -499,11 +818,12 @@ bool checkCertificateExpiry() {
 }
 
 void provisionCertificates() {
-  // Placeholder for certificate provisioning
-  // In a real implementation, this might fetch certificates from a server
-  // For now, we'll just check if we have valid certificates
-  Serial.println("🔐 Checking certificate status...");
-  checkCertificateExpiry();
+  if (deviceProvisioned) {
+    Serial.println("✅ Device already provisioned with unique certificate");
+    return;
+  }
+  
+  Serial.println("🔐 Device needs provisioning - will request during MQTT connection");
 }
 
 void loadCertificates() {
@@ -516,15 +836,25 @@ void loadCertificates() {
   prefs.end();
   
   if (!rootCAStr.isEmpty() && !deviceCertStr.isEmpty() && !privateKeyStr.isEmpty()) {
-    Serial.println("📋 Using certificates from preferences");
+    Serial.println("📋 Using provisioned device certificates");
+    Serial.println("🔍 Provisioned certificate details:");
+    Serial.println("   Root CA length: " + String(rootCAStr.length()) + " chars");
+    Serial.println("   Device cert length: " + String(deviceCertStr.length()) + " chars");
+    Serial.println("   Private key length: " + String(privateKeyStr.length()) + " chars");
     net.setCACert(rootCAStr.c_str());
     net.setCertificate(deviceCertStr.c_str());
     net.setPrivateKey(privateKeyStr.c_str());
+    deviceProvisioned = true;
   } else {
-    Serial.println("📋 Using embedded certificates");
+    Serial.println("📋 Using provisioning certificates (for JIT setup)");
+    Serial.println("🔍 Provisioning certificate details:");
+    Serial.println("   Root CA length: " + String(strlen(rootCA)) + " chars");
+    Serial.println("   Device cert length: " + String(strlen(deviceCert)) + " chars");
+    Serial.println("   Private key length: " + String(strlen(privateKey)) + " chars");
     net.setCACert(rootCA);
     net.setCertificate(deviceCert);
     net.setPrivateKey(privateKey);
+    deviceProvisioned = false;
   }
   
   Serial.println("✅ Certificates loaded");
@@ -640,7 +970,9 @@ void flushDebugBuffer() {
   
   String debugPayload;
   serializeJson(debugMsg, debugPayload);
-  mqtt.publish(mqttBaseTopic() + "diagnostics", debugPayload);
+  String topic = mqttBaseTopic() + "diagnostics";
+  Serial.println("📤 Publishing to topic: " + topic);
+  mqtt.publish(topic.c_str(), debugPayload.c_str());
   
   debugBuffer = "";
   lastDebugPublish = millis();
@@ -719,6 +1051,24 @@ void setup() {
   esp_log_level_set("*", ESP_LOG_NONE); // Stops verbose serial logging, if it happens
   bootTime = millis();
   
+  // Print hardware info
+  Serial.println("🔧 Hardware Info:");
+  Serial.println("   Chip: " + String(ESP.getChipModel()));
+  Serial.println("   Cores: " + String(ESP.getChipCores()));
+  Serial.println("   Flash: " + String(ESP.getFlashChipSize() / 1024 / 1024) + " MB");
+  Serial.println("   Free heap: " + String(ESP.getFreeHeap()) + " bytes");
+  Serial.println("   SDK version: " + String(ESP.getSdkVersion()));
+  
+  // Simple memory test
+  Serial.println("🧪 Memory test:");
+  void* testAlloc = malloc(1024);
+  if (testAlloc) {
+    Serial.println("   ✅ 1KB allocation successful");
+    free(testAlloc);
+  } else {
+    Serial.println("   ❌ 1KB allocation failed");
+  }
+  
   // Load emergency shutdown count from persistent storage
   loadEmergencyShutdownCount();
   
@@ -730,6 +1080,7 @@ void setup() {
   packetsThisMinute = 0;
   invalidPacketsThisMinute = 0;
   lastMinuteReset = millis();
+  provisioningAttempted = false; // Reset provisioning attempt flag on boot
   
   debugPrintln("🚀 IoT Gateway starting up...");
 
@@ -739,6 +1090,7 @@ void setup() {
   }
 
   // Try to provision certificates if we have a license key
+  Serial.println("🔍 License key check: " + (licenseKey.isEmpty() ? "EMPTY" : licenseKey.substring(0, 8) + "..."));
   if (!licenseKey.isEmpty()) {
     provisionCertificates();
   }
@@ -764,14 +1116,27 @@ void loop() {
   }
 
   mqtt.loop();
+  
+  // Debug MQTT connection status (only every 60 seconds to avoid spam)
+  static unsigned long lastDebugTime = 0;
+  unsigned long now = millis();
+  if (now - lastDebugTime > 60000) { // 60 seconds
+    Serial.println("🔍 MQTT Status - Connected: " + String(mqtt.connected() ? "YES" : "NO") + 
+                  ", WiFi: " + String(WiFi.status() == WL_CONNECTED ? "YES" : "NO"));
+    lastDebugTime = now;
+  }
 
-  // MQTT reconnect logic
-  if (WiFi.status() == WL_CONNECTED && !mqtt.connected()) {
-    unsigned long now = millis();
-    if (now - lastMqttReconnectAttempt > 5000) { // 5 second backoff
-      Serial.println("🔄 Attempting MQTT reconnect...");
+  // MQTT reconnect logic - only reconnect if actually disconnected
+  if (WiFi.status() == WL_CONNECTED && !mqtt.connected() && !mqttConnecting) {
+    if (now - lastMqttReconnectAttempt > 30000) { // 30 second backoff to avoid rate limiting
+      mqttConnecting = true;
+      Serial.println("🔄 MQTT disconnected, attempting reconnect...");
+      Serial.println("🔍 Last known state - WiFi: " + String(WiFi.status() == WL_CONNECTED ? "CONNECTED" : "DISCONNECTED") + 
+                    ", MQTT: DISCONNECTED, Heap: " + String(ESP.getFreeHeap()));
       connectMQTT();
       lastMqttReconnectAttempt = now;
+      mqttConnecting = false;
+      delay(5000); // Give MQTT time to establish connection
     }
   }
 
@@ -779,7 +1144,6 @@ void loop() {
   static int index = 0;
   
   // Reset minute counters every minute
-  unsigned long now = millis();
   if (now - lastMinuteReset >= 60000) { // 1 minute
     packetsThisMinute = 0;
     invalidPacketsThisMinute = 0;
@@ -820,7 +1184,9 @@ void loop() {
         
         String disablePayload;
         serializeJson(disableAlert, disablePayload);
-        mqtt.publish(mqttBaseTopic() + "diagnostics", disablePayload);
+        String topic = mqttBaseTopic() + "diagnostics";
+        Serial.println("📤 Publishing to topic: " + topic);
+        mqtt.publish(topic.c_str(), disablePayload.c_str());
         
         // Don't actually shutdown, just disable protection
         emergencyShutdown = false;
@@ -839,7 +1205,9 @@ void loop() {
       
       String emergencyPayload;
       serializeJson(emergency, emergencyPayload);
-      mqtt.publish(mqttBaseTopic() + "diagnostics", emergencyPayload);
+      String topic = mqttBaseTopic() + "diagnostics";
+      Serial.println("📤 Publishing to topic: " + topic);
+      mqtt.publish(topic.c_str(), emergencyPayload.c_str());
       
       // Disconnect MQTT to stop flooding
       mqtt.disconnect();
