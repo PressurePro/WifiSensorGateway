@@ -636,6 +636,14 @@ void publishSensorCache() {
 
   // Diagnostics
   StaticJsonDocument<512> diag;
+  
+  // Add device identification
+  JsonObject device = diag.createNestedObject("device");
+  device["license_key"] = licenseKey;
+  device["device_id"] = deviceId;
+  device["firmware_version"] = firmwareVersion;
+  device["hardware_id"] = getHardwareId();
+  
   JsonObject conn = diag.createNestedObject("connection");
   conn["signal_strength"] = WiFi.RSSI();
   conn["network_type"] = "WiFi";
