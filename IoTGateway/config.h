@@ -1,6 +1,6 @@
 #pragma once
 
-#define FIRMWARE_VERSION "1.0.7"
+#define FIRMWARE_VERSION "1.0.8"
 #define INTERVAL_MINUTES 5
 #define AWS_IOT_ENDPOINT "a1vqmzc3f7mie5-ats.iot.us-west-2.amazonaws.com"
 
