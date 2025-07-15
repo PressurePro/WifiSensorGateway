@@ -1190,9 +1190,19 @@ void loop() {
         validationErrors += "invalid_ambient ";
       }
       
-      // TEMPORARILY DISABLE PACKET VALIDATION FOR DEPLOYMENT
-      // TODO: Re-enable after validation logic is fixed
-      /*
+      // 8. Check for heartbeat messages (FA3000 pattern with all-zero values)
+      if (packet[1] == 0xFA && packet[2] == 0x30 && packet[3] == 0x00) {
+        isValidPacket = false;
+        validationErrors += "heartbeat_message ";
+      }
+      
+      // 9. Check for all-zero readings (pressure, temperature, RSSI, ambient)
+      if (packet[4] == 0x00 && packet[5] == 0x00 && packet[6] == 0x00 && packet[7] == 0x00) {
+        isValidPacket = false;
+        validationErrors += "all_zero_readings ";
+      }
+      
+      // Apply validation
       if (!isValidPacket) {
         if (debugMode) {
           debugPrintln("❌ Invalid packet: " + validationErrors + " | " + 
@@ -1204,9 +1214,6 @@ void loop() {
         }
         continue;
       }
-      */
-      // Accept all packets for now
-      isValidPacket = true;
       
       // Packet is valid!
       lastValidPacket = millis();
