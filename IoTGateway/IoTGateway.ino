@@ -59,6 +59,8 @@ bool emergencyShutdown = false; // Emergency shutdown flag
 unsigned long totalBytesReceived = 0; // Total bytes received (for debugging)
 unsigned long emergencyShutdownCount = 0; // Count of emergency shutdowns
 bool emergencyProtectionDisabled = false; // Permanent disable flag
+unsigned long lastInternetCheck = 0; // Track last internet connectivity check
+unsigned long internetCheckInterval = 5 * 60 * 1000; // Check every 5 minutes
 
 struct SensorReading {
   std::string serialNumber;
@@ -221,6 +223,7 @@ void handleCommandMessage(String &topic, String &payload) {
         Serial.println("❌ Emergency shutdown command missing 'enabled' field");
       }
     }
+
     if (action == "disable_emergency_protection") {
       emergencyProtectionDisabled = true;
       saveEmergencyShutdownCount();
@@ -526,6 +529,41 @@ void connectMQTT() {
   }
 }
 
+bool checkInternetConnectivity() {
+  Serial.println("🌐 Checking internet connectivity...");
+  
+  // Try to connect to a reliable external service
+  HTTPClient http;
+  http.setTimeout(10000); // 10 second timeout
+  
+  // Try multiple endpoints for redundancy
+  const char* endpoints[] = {
+    "http://www.google.com",
+    "http://www.cloudflare.com", 
+    "http://www.amazon.com"
+  };
+  
+  for (int i = 0; i < 3; i++) {
+    Serial.println("🔍 Testing connectivity to: " + String(endpoints[i]));
+    
+    http.begin(endpoints[i]);
+    int httpCode = http.GET();
+    http.end();
+    
+    if (httpCode == HTTP_CODE_OK) {
+      Serial.println("✅ Internet connectivity confirmed");
+      return true;
+    } else {
+      Serial.println("❌ Failed to reach " + String(endpoints[i]) + " (HTTP: " + String(httpCode) + ")");
+    }
+    
+    delay(1000); // Wait between attempts
+  }
+  
+  Serial.println("❌ No internet connectivity detected");
+  return false;
+}
+
 bool tryWiFiConnection() {
   Serial.println("🔍 Attempting WiFi connection...");
   prefs.begin("wifi", true);
@@ -555,11 +593,18 @@ bool tryWiFiConnection() {
 
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("❌ WiFi connection failed after " + String((millis() - startAttemptTime) / 1000) + " seconds");
+    return false;
   } else {
     Serial.println("✅ WiFi connected successfully");
   }
+  
+  // Check internet connectivity
+  if (!checkInternetConnectivity()) {
+    Serial.println("⚠️ WiFi connected but no internet access - starting AP mode");
+    return false;
+  }
 
-  return WiFi.status() == WL_CONNECTED;
+  return true;
 }
 
 void startAPMode() {
@@ -1244,6 +1289,27 @@ void loop() {
   if (millis() - lastPublishTime >= intervalMinutes * 60UL * 1000UL) {
     debugPrintln("Sending Cache!");
     publishSensorCache();
+  }
+  
+  // Periodic internet connectivity check
+  if (millis() - lastInternetCheck >= internetCheckInterval) {
+    lastInternetCheck = millis();
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      if (!checkInternetConnectivity()) {
+        Serial.println("⚠️ Internet connectivity lost - attempting to reconnect...");
+        
+        // Try to reconnect WiFi first
+        WiFi.disconnect();
+        delay(2000);
+        
+        if (!tryWiFiConnection()) {
+          Serial.println("❌ Failed to reconnect with internet - restarting device");
+          delay(2000);
+          ESP.restart();
+        }
+      }
+    }
   }
 }
 
