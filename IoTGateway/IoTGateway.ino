@@ -443,15 +443,20 @@ void messageReceived(char* topic, byte* payload, unsigned int length) {
 }
 
 void connectMQTT() {
-  Serial.println("🔗 Connecting to MQTT broker: " + String(AWS_IOT_ENDPOINT));
+  Serial.println("🔗 ========================================");
+  Serial.println("🔗 Attempting MQTT Connection");
+  Serial.println("🔗 ========================================");
+  Serial.println("🌐 MQTT Broker: " + String(AWS_IOT_ENDPOINT));
   
   // Clear any existing connection
   if (mqtt.connected()) {
+    Serial.println("🔌 Disconnecting existing MQTT connection...");
     mqtt.disconnect();
     delay(1000);
   }
   
   // Set up PubSubClient
+  Serial.println("⚙️ Configuring MQTT client...");
   mqtt.setServer(AWS_IOT_ENDPOINT, 8883);
   mqtt.setCallback(messageReceived);
   mqtt.setKeepAlive(60); // 60 second keepalive (more stable)
@@ -460,29 +465,45 @@ void connectMQTT() {
 
   // Generate unique client ID using MAC address
   String clientId = "esp32c6-" + getHardwareId();
+  Serial.println("🆔 Client ID: " + clientId);
   
+  Serial.println("🔐 Certificate status: " + (deviceProvisioned ? "PROVISIONED" : "PROVISIONING"));
+  
+  Serial.print("🔗 Connecting to MQTT broker");
   int attempts = 0;
   while (!mqtt.connect(clientId.c_str()) && attempts < 10) {
     Serial.print(".");
     delay(1000);
     attempts++;
   }
+  Serial.println();
   
   if (mqtt.connected()) {
-    Serial.println("\n✅ MQTT connected successfully!");
+    Serial.println("✅ MQTT connected successfully!");
+    Serial.println("📊 MQTT Connection Details:");
+    Serial.println("   Client ID: " + clientId);
+    Serial.println("   Broker: " + String(AWS_IOT_ENDPOINT));
+    Serial.println("   Port: 8883 (TLS)");
+    Serial.println("   Keepalive: 60 seconds");
+    Serial.println("   Buffer Size: " + String(MQTT_BUFFER_SIZE) + " bytes");
     
     // Subscribe to topics
+    Serial.println("📡 Subscribing to MQTT topics...");
     mqtt.subscribe((mqttBaseTopic() + "commands").c_str());
     mqtt.subscribe((mqttBaseTopic() + "firmware").c_str());
     mqtt.subscribe("pressurepro/devices/WifiSensorGateway/firmware");
+    Serial.println("✅ MQTT subscriptions active");
     
     // If using provisioning certificates, send provisioning request
     if (!deviceProvisioned && !provisioningAttempted) {
-      Serial.println("📤 Sending provisioning request...");
+      Serial.println("🔐 ========================================");
+      Serial.println("🔐 Starting Certificate Provisioning");
+      Serial.println("🔐 ========================================");
       provisioningAttempted = true; // Mark that we've attempted provisioning
       
       // Subscribe to provisioning response topic
       String provisioningTopic = "pressurepro/devices/WifiSensorGateway/provisioning/" + licenseKey + "/response";
+      Serial.println("📡 Subscribing to provisioning response: " + provisioningTopic);
       mqtt.subscribe(provisioningTopic.c_str());
       
       // Send provisioning request
@@ -498,10 +519,12 @@ void connectMQTT() {
       serializeJson(request, requestPayload);
       
       String requestTopic = "pressurepro/devices/WifiSensorGateway/provisioning/request";
+      Serial.println("📤 Sending provisioning request to: " + requestTopic);
       bool publishResult = mqtt.publish(requestTopic.c_str(), requestPayload.c_str());
       
       if (publishResult) {
-        Serial.println("📤 Provisioning request sent, waiting for response...");
+        Serial.println("✅ Provisioning request sent successfully");
+        Serial.println("⏳ Waiting for provisioning response (30 second timeout)...");
         
         // Wait for response (with timeout)
         unsigned long startTime = millis();
@@ -509,7 +532,10 @@ void connectMQTT() {
           mqtt.loop();
           
           if (deviceProvisioned) {
-            Serial.println("✅ Device successfully provisioned!");
+            Serial.println("🎉 Device successfully provisioned!");
+            Serial.println("🔐 ========================================");
+            Serial.println("🔐 Provisioning completed successfully");
+            Serial.println("🔐 ========================================");
             return; // Exit the function to reconnect with new certificates
           }
           
@@ -517,20 +543,40 @@ void connectMQTT() {
         }
         
         Serial.println("❌ Provisioning timeout - no response received");
+        Serial.println("🔐 ========================================");
+        Serial.println("🔐 Provisioning failed - continuing with provisioning certificates");
+        Serial.println("🔐 ========================================");
       } else {
         Serial.println("❌ Failed to send provisioning request");
+        Serial.println("🔐 ========================================");
+        Serial.println("🔐 Provisioning failed - continuing with provisioning certificates");
+        Serial.println("🔐 ========================================");
       }
+    } else if (deviceProvisioned) {
+      Serial.println("✅ Device already provisioned with unique certificates");
     }
+    
+    Serial.println("🔗 ========================================");
+    Serial.println("🔗 MQTT Connection Established Successfully");
+    Serial.println("🔗 ========================================");
   } else {
-    Serial.println("\n❌ MQTT connection failed after " + String(attempts) + " attempts");
-    Serial.println("🔍 Debug info - WiFi status: " + String(WiFi.status()) + 
-                  ", RSSI: " + String(WiFi.RSSI()) + 
-                  ", IP: " + WiFi.localIP().toString());
+    Serial.println("❌ MQTT connection failed after " + String(attempts) + " attempts");
+    Serial.println("🔍 Debug info:");
+    Serial.println("   WiFi status: " + String(WiFi.status()) + 
+                  " (" + (WiFi.status() == WL_CONNECTED ? "CONNECTED" : "DISCONNECTED") + ")");
+    Serial.println("   WiFi RSSI: " + String(WiFi.RSSI()) + " dBm");
+    Serial.println("   IP Address: " + WiFi.localIP().toString());
+    Serial.println("   MQTT State: " + String(mqtt.state()));
+    Serial.println("🔗 ========================================");
+    Serial.println("🔗 MQTT Connection Failed");
+    Serial.println("🔗 ========================================");
   }
 }
 
 bool checkInternetConnectivity() {
-  Serial.println("🌐 Checking internet connectivity...");
+  Serial.println("🌐 ========================================");
+  Serial.println("🌐 Checking Internet Connectivity");
+  Serial.println("🌐 ========================================");
   
   // Try to connect to a reliable external service
   HTTPClient http;
@@ -551,7 +597,10 @@ bool checkInternetConnectivity() {
     http.end();
     
     if (httpCode == HTTP_CODE_OK) {
-      Serial.println("✅ Internet connectivity confirmed");
+      Serial.println("✅ Internet connectivity confirmed via " + String(endpoints[i]));
+      Serial.println("🌐 ========================================");
+      Serial.println("🌐 Internet connectivity: AVAILABLE");
+      Serial.println("🌐 ========================================");
       return true;
     } else {
       Serial.println("❌ Failed to reach " + String(endpoints[i]) + " (HTTP: " + String(httpCode) + ")");
@@ -560,7 +609,10 @@ bool checkInternetConnectivity() {
     delay(1000); // Wait between attempts
   }
   
-  Serial.println("❌ No internet connectivity detected");
+  Serial.println("❌ All connectivity tests failed");
+  Serial.println("🌐 ========================================");
+  Serial.println("🌐 Internet connectivity: UNAVAILABLE");
+  Serial.println("🌐 ========================================");
   return false;
 }
 
@@ -582,47 +634,70 @@ bool tryWiFiConnection() {
     return false;
   }
 
+  Serial.println("📡 Configuring WiFi antenna...");
   pinMode(WIFI_ANT_CONFIG, OUTPUT);
   digitalWrite(WIFI_ANT_CONFIG, HIGH);
 
+  Serial.println("🔗 Connecting to WiFi network: " + ssid);
   WiFi.begin(ssid.c_str(), pass.c_str());
   unsigned long startAttemptTime = millis();
+  
+  Serial.print("⏳ Waiting for connection");
   while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < AP_TIMEOUT_MS) {
+    Serial.print(".");
     delay(100);
   }
+  Serial.println();
 
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("❌ WiFi connection failed after " + String((millis() - startAttemptTime) / 1000) + " seconds");
+    Serial.println("🔍 WiFi status: " + String(WiFi.status()));
     return false;
   } else {
     Serial.println("✅ WiFi connected successfully");
+    Serial.println("📊 Connection details:");
+    Serial.println("   SSID: " + WiFi.SSID());
+    Serial.println("   IP Address: " + WiFi.localIP().toString());
+    Serial.println("   Gateway: " + WiFi.gatewayIP().toString());
+    Serial.println("   DNS: " + WiFi.dnsIP().toString());
+    Serial.println("   Signal Strength: " + String(WiFi.RSSI()) + " dBm");
   }
   
   // Check internet connectivity
+  Serial.println("🌐 Checking internet connectivity...");
   if (!checkInternetConnectivity()) {
     Serial.println("⚠️ WiFi connected but no internet access - starting AP mode");
     return false;
   }
 
+  Serial.println("✅ Internet connectivity confirmed");
   return true;
 }
 
 void startAPMode() {
-  Serial.println("📶 Starting AP mode...");
+  Serial.println("📶 ========================================");
+  Serial.println("📶 Starting AP (Access Point) Mode");
+  Serial.println("📶 ========================================");
   
   // Disconnect from any existing WiFi connection
+  Serial.println("🔌 Disconnecting from existing WiFi...");
   WiFi.disconnect();
   delay(100);
   
   // Set WiFi mode to AP only
+  Serial.println("📡 Configuring WiFi for AP mode...");
   WiFi.mode(WIFI_AP);
   delay(100);
   
   inApMode = true;
   String ssid = "PressurePro-Gateway" + getHardwareId();
+  Serial.println("📶 Creating access point: " + ssid);
   WiFi.softAP(ssid.c_str(), "configureme");
+  
+  Serial.println("🌐 Starting DNS server...");
   dns.start(DNS_PORT, "*", WiFi.softAPIP());
 
+  Serial.println("🌐 Setting up web server...");
   server.onNotFound([]() {
     server.sendHeader("Location", String("http://") + WiFi.softAPIP().toString(), true);
     server.send(302, "text/plain", "");
@@ -633,6 +708,7 @@ void startAPMode() {
   });
 
   server.on("/", HTTP_POST, []() {
+    Serial.println("📝 Configuration received from web interface");
     prefs.begin("wifi", false);
     prefs.putString("ssid", server.arg("ssid"));
     prefs.putString("password", server.arg("password"));
@@ -641,12 +717,23 @@ void startAPMode() {
     prefs.putInt("interval", server.arg("interval").toInt());
     prefs.end();
     server.send(200, "text/html", "Saved. Rebooting...");
+    Serial.println("✅ Configuration saved - rebooting in 2 seconds...");
     delay(2000);
     ESP.restart();
   });
 
   server.begin();
-  Serial.println("📶 AP Mode Started: " + ssid);
+  Serial.println("✅ AP Mode Started Successfully");
+  Serial.println("📊 AP Details:");
+  Serial.println("   SSID: " + ssid);
+  Serial.println("   Password: configureme");
+  Serial.println("   IP Address: " + WiFi.softAPIP().toString());
+  Serial.println("   DNS Server: Active on port 53");
+  Serial.println("   Web Server: Active on port 80");
+  Serial.println("📶 ========================================");
+  Serial.println("📶 Operating in AP CONFIGURATION mode");
+  Serial.println("📶 Connect to WiFi network above to configure");
+  Serial.println("📶 ========================================");
 }
 
 void publishSensorCache() {
@@ -750,7 +837,9 @@ void provisionCertificates() {
 
 
 void loadCertificates() {
-  Serial.println("🔐 Loading certificates for MQTT connection...");
+  Serial.println("🔐 ========================================");
+  Serial.println("🔐 Loading Certificates");
+  Serial.println("🔐 ========================================");
   
   prefs.begin("certs", true);
   String rootCAStr = prefs.getString("rootca", "");
@@ -760,27 +849,37 @@ void loadCertificates() {
   
   if (!rootCAStr.isEmpty() && !deviceCertStr.isEmpty() && !privateKeyStr.isEmpty()) {
     Serial.println("📋 Using provisioned device certificates");
-    Serial.println("🔍 Provisioned certificate details:");
-    Serial.println("   Root CA length: " + String(rootCAStr.length()) + " chars");
-    Serial.println("   Device cert length: " + String(deviceCertStr.length()) + " chars");
-    Serial.println("   Private key length: " + String(privateKeyStr.length()) + " chars");
+    Serial.println("🔍 Certificate details:");
+    Serial.println("   Root CA: " + String(rootCAStr.length()) + " characters");
+    Serial.println("   Device Cert: " + String(deviceCertStr.length()) + " characters");
+    Serial.println("   Private Key: " + String(privateKeyStr.length()) + " characters");
+    
+    Serial.println("🔐 Setting certificate chain...");
     net.setCACert(rootCAStr.c_str());
     net.setCertificate(deviceCertStr.c_str());
     net.setPrivateKey(privateKeyStr.c_str());
     deviceProvisioned = true;
+    
+    Serial.println("✅ Provisioned certificates loaded successfully");
   } else {
     Serial.println("📋 Using provisioning certificates (for JIT setup)");
-    Serial.println("🔍 Provisioning certificate details:");
-    Serial.println("   Root CA length: " + String(strlen(rootCA)) + " chars");
-    Serial.println("   Device cert length: " + String(strlen(deviceCert)) + " chars");
-    Serial.println("   Private key length: " + String(strlen(privateKey)) + " chars");
+    Serial.println("🔍 Certificate details:");
+    Serial.println("   Root CA: " + String(strlen(rootCA)) + " characters");
+    Serial.println("   Device Cert: " + String(strlen(deviceCert)) + " characters");
+    Serial.println("   Private Key: " + String(strlen(privateKey)) + " characters");
+    
+    Serial.println("🔐 Setting certificate chain...");
     net.setCACert(rootCA);
     net.setCertificate(deviceCert);
     net.setPrivateKey(privateKey);
     deviceProvisioned = false;
+    
+    Serial.println("✅ Provisioning certificates loaded successfully");
   }
   
-  Serial.println("✅ Certificates loaded");
+  Serial.println("🔐 ========================================");
+  Serial.println("🔐 Certificates loaded successfully");
+  Serial.println("🔐 ========================================");
 }
 
 bool tryAlternativeUpdate(String url) {
@@ -974,6 +1073,10 @@ void setup() {
   esp_log_level_set("*", ESP_LOG_NONE); // Stops verbose serial logging, if it happens
   bootTime = millis();
   
+  Serial.println("🚀 ========================================");
+  Serial.println("🚀 IoT Gateway Starting Up");
+  Serial.println("🚀 ========================================");
+  
   // Print hardware info
   Serial.println("🔧 Hardware Info:");
   Serial.println("   Chip: " + String(ESP.getChipModel()));
@@ -1005,9 +1108,13 @@ void setup() {
   lastMinuteReset = millis();
   provisioningAttempted = false; // Reset provisioning attempt flag on boot
   
-  debugPrintln("🚀 IoT Gateway starting up...");
+  Serial.println("🔍 ========================================");
+  Serial.println("🔍 Starting Device Initialization");
+  Serial.println("🔍 ========================================");
 
+  Serial.println("📡 Attempting WiFi connection...");
   if (!tryWiFiConnection()) {
+    Serial.println("❌ WiFi connection failed - entering AP mode");
     startAPMode();
     return;
   }
@@ -1015,20 +1122,35 @@ void setup() {
   // Try to provision certificates if we have a license key
   Serial.println("🔍 License key check: " + (licenseKey.isEmpty() ? "EMPTY" : licenseKey.substring(0, 8) + "..."));
   if (!licenseKey.isEmpty()) {
+    Serial.println("🔐 Certificate provisioning check...");
     provisionCertificates();
+  } else {
+    Serial.println("⚠️ No license key found - will use provisioning certificates");
   }
   
+  Serial.println("🔐 Loading certificates...");
   loadCertificates();
+  
+  Serial.println("⏰ Setting up time synchronization...");
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
   time_t now;
   while (time(&now) < 100000) delay(100);
+  Serial.println("✅ Time synchronized");
 
+  Serial.println("🔗 Attempting MQTT connection...");
   connectMQTT();
+  
+  Serial.println("🛰️ Initializing TPMS sensor interface...");
   Serial1.begin(UART_BAUD, SERIAL_8N1, UART_RX, UART_TX);
-  Serial.println("🛰️  Listening for TPMS packets...");
+  Serial.println("✅ TPMS interface ready - listening for packets...");
   
   // Give system time to stabilize before processing packets
   delay(2000);
+  
+  Serial.println("✅ ========================================");
+  Serial.println("✅ Device initialization complete");
+  Serial.println("✅ Operating in NORMAL mode");
+  Serial.println("✅ ========================================");
 }
 
 void loop() {
@@ -1044,8 +1166,27 @@ void loop() {
   static unsigned long lastDebugTime = 0;
   unsigned long now = millis();
   if (now - lastDebugTime > 60000) { // 60 seconds
-    Serial.println("🔍 MQTT Status - Connected: " + String(mqtt.connected() ? "YES" : "NO") + 
-                  ", WiFi: " + String(WiFi.status() == WL_CONNECTED ? "YES" : "NO"));
+    Serial.println("📊 ========================================");
+    Serial.println("📊 Device Status Report");
+    Serial.println("📊 ========================================");
+    Serial.println("🔧 Operating Mode: NORMAL");
+    Serial.println("📡 WiFi Status: " + String(WiFi.status() == WL_CONNECTED ? "CONNECTED" : "DISCONNECTED"));
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("   SSID: " + WiFi.SSID());
+      Serial.println("   IP: " + WiFi.localIP().toString());
+      Serial.println("   RSSI: " + String(WiFi.RSSI()) + " dBm");
+    }
+    Serial.println("🔗 MQTT Status: " + String(mqtt.connected() ? "CONNECTED" : "DISCONNECTED"));
+    if (mqtt.connected()) {
+      Serial.println("   Broker: " + String(AWS_IOT_ENDPOINT));
+      Serial.println("   Client ID: esp32c6-" + getHardwareId());
+    }
+    Serial.println("🔐 Certificate Status: " + String(deviceProvisioned ? "PROVISIONED" : "PROVISIONING"));
+    Serial.println("📦 Sensor Cache: " + String(sensorCache.size()) + " sensors");
+    Serial.println("📊 Packet Stats: " + String(packetCount) + " total, " + String(invalidPacketCount) + " invalid");
+    Serial.println("💾 Free Heap: " + String(ESP.getFreeHeap()) + " bytes");
+    Serial.println("⏱️ Uptime: " + String((millis() - bootTime) / 1000) + " seconds");
+    Serial.println("📊 ========================================");
     lastDebugTime = now;
   }
 
@@ -1296,19 +1437,29 @@ void loop() {
     lastInternetCheck = millis();
     
     if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("🔍 Periodic internet connectivity check...");
       if (!checkInternetConnectivity()) {
         Serial.println("⚠️ Internet connectivity lost - attempting to reconnect...");
         
         // Try to reconnect WiFi first
+        Serial.println("🔄 Disconnecting WiFi to attempt reconnection...");
         WiFi.disconnect();
         delay(2000);
         
+        Serial.println("🔄 Attempting WiFi reconnection...");
         if (!tryWiFiConnection()) {
           Serial.println("❌ Failed to reconnect with internet - restarting device");
+          Serial.println("🔄 Device restart in 2 seconds...");
           delay(2000);
           ESP.restart();
+        } else {
+          Serial.println("✅ WiFi reconnection successful");
         }
+      } else {
+        Serial.println("✅ Periodic internet check passed");
       }
+    } else {
+      Serial.println("⚠️ WiFi disconnected during periodic check");
     }
   }
 }
